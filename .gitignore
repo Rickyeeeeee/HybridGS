@@ -1,0 +1,11 @@
+submodules/simple-knn/build
+
+# ignore .devcontainer
+.devcontainer
+# ignore .vscode
+.vscode
+
+Dockerfile
+
+# ignore modules cache
+*.pyc
