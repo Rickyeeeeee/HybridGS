@@ -475,6 +475,11 @@ class BBSplatGaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
+    def set_base_grad_to_zero(self):
+        if self._xyz.grad is not None:
+            self._xyz.grad[:].zero_()
+
+
     def replace_tensors_to_optimizer(self, inds=None):
         tensors_dict = {"xyz": self._xyz,
                         "f_dc": self._features_dc,

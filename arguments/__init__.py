@@ -82,6 +82,7 @@ class PipelineParams(ParamGroup):
     def __init__(self, parser):
         self.convert_SHs_python = False
         self.compute_cov3D_python = False
+        self.depth_ratio = 0.0
         self.debug = False
         super().__init__(parser, "Pipeline Parameters")
 
@@ -127,6 +128,32 @@ class OptimizationParams(ParamGroup):
         self.max_all_points = 6000_000
         self.exposure_compensation = False
         self.random_background = False
+
+        self.texture_opacity_lr = 0.001
+        self.texture_color_lr = 0.0025
+        self.percent_dense = 0.1
+        self.lambda_dssim = 0.2
+        self.lambda_dist = 0.0 #100.0
+        self.lambda_normal = 0.0 #0.05
+        self.lambda_texture_value = 0.0001
+        self.lambda_alpha_value = 0.0001
+        self.max_impact_threshold = 500
+
+        # Densification policy
+        self.texture_from_iter = 500
+        self.texture_to_iter = 30000
+        self.densification_interval = 100
+        self.densify_from_iter = 500
+        self.densify_until_iter = 25000
+
+        # MCMC
+        self.noise_lr = 5e5
+        self.opacity_reg = 0.01
+        self.cap_max = 160_000
+
+        # Data
+        self.max_read_points = self.cap_max - 20_000
+        self.add_sky_box = False
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

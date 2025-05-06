@@ -5,7 +5,7 @@ data_base_path='/workspace/data/replica_sclike_colmap_dnsplatter/dtu_dataset/dtu
 out_base_path='/workspace/work/Outputs/dtu'
 eval_path='/workspace/data/replica_sclike_colmap_dnsplatter/dtu_dataset/MVS_Data'
 source_name='pgsr'
-out_name='from_pgsr'
+out_name='bbsplat_from_pgsr'
 gpu_id=3
 
 for scene in scenes:
@@ -17,12 +17,12 @@ for scene in scenes:
     print(cmd)
     os.system(cmd)
 
-    common_args = " -r2 --ncc_scale 0.5"
+    common_args = " -r2 --ncc_scale 0.5 --iterations 5000"
     cmd = f'CUDA_VISIBLE_DEVICES={gpu_id} python refine.py \
             -s {data_base_path}/scan{scene} \
             -m {out_base_path}/{out_name}/dtu_scan{scene} \
             --source_model_path {out_base_path}/{source_name}/dtu_scan{scene}/mesh \
-            --source_ply_name sample-100000.ply \
+            --source_ply_name sample-10000.ply \
             {common_args}'
     print(cmd)
     os.system(cmd)

@@ -6,7 +6,8 @@ import numpy as np
 from random import randint
 from utils.loss_utils import l1_loss, ssim, lncc, get_img_grad_weight
 from utils.graphics_utils import patch_offsets, patch_warp
-from gaussian_renderer import render_3dgs, network_gui
+from utils.general_utils import build_scaling_rotation
+from gaussian_renderer import render_3dgs, render_bbsplat, network_gui
 import sys, time
 from scene import Scene, GaussianModel
 from scene.refine_model import RefineGaussianModel
@@ -46,19 +47,19 @@ def refinement(dataset, opt, pipe, testing_iterations, saving_iterations, checkp
 
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians, load_iteration=None)
-    refine_gaussians = BBSplatGaussianModel(sh_degree=3)
+    bbsplat_gaussians = BBSplatGaussianModel(sh_degree=3)
     source_model_ply_path = os.path.join(dataset.source_model_path, dataset.source_ply_name)
     pcd = fetchPly(source_model_ply_path)
-    refine_gaussians.create_from_pcd(pcd, scene.cameras_extent)
-    refine_gaussians.training_setup(opt)
+    bbsplat_gaussians.create_from_pcd(pcd, scene.cameras_extent, add_sky_box=False)
+    bbsplat_gaussians.training_setup(opt)
 
     app_model = AppModel()
     app_model.train()
     app_model.cuda()
 
-    refine_gaussians.use_app = opt.exposure_compensation
+    bbsplat_gaussians.use_app = opt.exposure_compensation
 
-    if refine_gaussians.use_app:
+    if bbsplat_gaussians.use_app:
         app_model.load_weights(scene.model_path)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -69,12 +70,16 @@ def refinement(dataset, opt, pipe, testing_iterations, saving_iterations, checkp
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
+    ema_dist_for_log = 0.0
+    ema_normal_for_log = 0.0
+    ema_texture_for_log = 0.0
+    initial_texture_alpha = bbsplat_gaussians.get_texture_alpha[0:1].detach().clone()
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
 
     for iteration in range(first_iter, opt.iterations + 1):
         iter_start.record()
-        refine_gaussians.update_learning_rate(iteration)
+        xyz_lr = bbsplat_gaussians.update_learning_rate(iteration)
 
         # if not viewpoint_stack:
         #     viewpoint_stack = scene.getTrainCameras().copy()
@@ -87,126 +92,122 @@ def refinement(dataset, opt, pipe, testing_iterations, saving_iterations, checkp
         gt_image, _ = viewpoint_cam.get_image()
         
         bg = torch.rand((3), device="cuda") if opt.random_background else background
-        render_pkg = render_3dgs(viewpoint_cam, refine_gaussians, pipe, bg, app_model=app_model,
-                            return_plane=False, return_depth_normal=False)
-        image, viewspace_point_tensor, visibility_filter, radii = \
-            render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-
-        # Loss
-        ssim_loss = (1.0 - ssim(image, gt_image))
-        if 'app_image' in render_pkg and ssim_loss < 0.5:
-            app_image = render_pkg['app_image']
-            Ll1 = l1_loss(app_image, gt_image)
-        else:
-            Ll1 = l1_loss(image, gt_image)
-        image_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss
-        loss = image_loss.clone()
-
-        # scale loss
-        # if visibility_filter.sum() > 0:
-        #     scale = refine_gaussians.get_scaling[visibility_filter]
-        #     sorted_scale, _ = torch.sort(scale, dim=-1)
-        #     min_scale_loss = sorted_scale[...,0]
-        #     loss += opt.scale_loss_weight * min_scale_loss.mean()
+        render_pkg = render_bbsplat(viewpoint_cam, bbsplat_gaussians, pipe, bg)
         
-        loss.backward()
+        image: torch.Tensor
+        viewspace_point_tensor: torch.Tensor
+        visibility_filter: torch.Tensor  # Possibly a BoolTensor (dtype=torch.bool)
+        radii: torch.Tensor
+        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        impact = render_pkg["impact"]
+        # image, viewspace_point_tensor, visibility_filter, radii = \
+        #     render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+
+        gt_image = viewpoint_cam.original_image.cuda()
+
+        image_ycbcr = image
+        gt_image_ycbcr = gt_image
+
+        Ll1 = l1_loss(image_ycbcr, gt_image_ycbcr)
+        ssim_map = ssim(image.unsqueeze(0), gt_image.unsqueeze(0), size_average=False)
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_map.mean())
+        
+        # regularization
+        lambda_normal = opt.lambda_normal if iteration > 7000 else 0.0
+        lambda_dist = opt.lambda_dist if iteration > 3000 else 0.0
+
+        rend_dist = render_pkg["rend_dist"]
+        rend_normal = render_pkg['rend_normal']
+        surf_normal = render_pkg['surf_normal']
+        normal_error = (1 - (rend_normal * surf_normal).sum(dim=0))[None]
+        normal_loss = lambda_normal * (normal_error).mean()
+        dist_loss = lambda_dist * (rend_dist).mean()
+
+        weights = opt.max_impact_threshold - torch.clamp(impact[visibility_filter], 0, opt.max_impact_threshold)
+        textures_reg = (bbsplat_gaussians.get_texture_color[visibility_filter].mean(dim=[1, 2, 3]) * weights).mean() * opt.lambda_texture_value
+        textures_reg += torch.abs((bbsplat_gaussians.get_texture_alpha[visibility_filter] - initial_texture_alpha).mean(dim=[1, 2]) * weights).mean() * opt.lambda_alpha_value
+
+        # loss
+        total_loss = loss + dist_loss + normal_loss + textures_reg
+        # For MCMC sampler
+        total_loss += opt.opacity_reg * bbsplat_gaussians.get_texture_alpha.mean()
+        total_loss.backward()
         iter_end.record()
 
         with torch.no_grad():
-            ema_loss_for_log = 0.4 * image_loss.item() + 0.6 * ema_loss_for_log
+             # Progress bar
+            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+            ema_dist_for_log = 0.4 * dist_loss.item() + 0.6 * ema_dist_for_log
+            ema_normal_for_log = 0.4 * normal_loss.item() + 0.6 * ema_normal_for_log
+            ema_texture_for_log = 0.4 * textures_reg.item() + 0.6 * ema_texture_for_log
+
+
             if iteration % 10 == 0:
                 loss_dict = {
                     "Loss": f"{ema_loss_for_log:.{5}f}",
-                    "Points": f"{len(refine_gaussians.get_xyz)}"
+                    "distort": f"{ema_dist_for_log:.{5}f}",
+                    "normal": f"{ema_normal_for_log:.{5}f}",
+                    "texture": f"{ema_texture_for_log:.{5}f}",
+                    "Points": f"{len(bbsplat_gaussians.get_xyz)}"
                 }
                 progress_bar.set_postfix(loss_dict)
+
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, refine_gaussians, render_3dgs, (pipe, background), app_model)
+            if tb_writer is not None:
+                tb_writer.add_scalar('train_loss_patches/dist_loss', ema_dist_for_log, iteration)
+                tb_writer.add_scalar('train_loss_patches/normal_loss', ema_normal_for_log, iteration)
+
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render_bbsplat, (pipe, background))
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
-                point_cloud_path = os.path.join(scene.model_path, "point_cloud/iteration_{}".format(iteration + load_iteration))
-                refine_gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
+                scene.save(iteration)
+
+            if opt.texture_from_iter <= iteration < opt.texture_to_iter:
+                bbsplat_gaussians.activate_texture_training()
+
+            if iteration >= opt.texture_to_iter:
+                bbsplat_gaussians.deactivate_texture_training()
+
+            if iteration > opt.position_lr_max_steps:
+                bbsplat_gaussians.deactivate_gaussians_training()
 
             # Densification
-            # if iteration < opt.densify_until_iter:
-            #     # Keep track of max radii in image-space for pruning
-            #     mask = (render_pkg["out_observe"] > 0) & visibility_filter
-            #     refine_gaussians.max_radii2D[mask] = torch.max(refine_gaussians.max_radii2D[mask], radii[mask])
-            #     viewspace_point_tensor_abs = render_pkg["viewspace_points_abs"]
-            #     refine_gaussians.add_image_densification_stats(viewspace_point_tensor, viewspace_point_tensor_abs, visibility_filter)
-            #     refine_gaussians.increment_denom(visibility_filter)
+            # if iteration < opt.densify_until_iter and iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+            #     size = len(gaussians.get_texture_alpha)
+            #     dead_mask = (gaussians.get_texture_alpha.view(size, -1).mean(1) <= 0.005).squeeze(-1)
+            #     gaussians.relocate_gs(dead_mask=dead_mask)
+            #     gaussians.add_new_gs(cap_max=opt.cap_max)
 
-            #     if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-            #         size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-            #         refine_gaussians.densify_and_prune(opt.densify_grad_threshold, opt.densify_abs_grad_threshold, 
-            #                                     opt.opacity_cull_threshold, scene.cameras_extent, size_threshold)
-            
-            # reset_opacity
-            # if iteration < opt.densify_until_iter:
-            #     if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
-            #         refine_gaussians.reset_opacity(reset_base=True)
+            bbsplat_gaussians.set_base_grad_to_zero()
 
             # Optimizer step
             if iteration < opt.iterations:
-                refine_gaussians.set_base_grad_to_zero()
-                refine_gaussians.optimizer.step()
-                app_model.optimizer.step()
-                refine_gaussians.optimizer.zero_grad(set_to_none=True)
-                app_model.optimizer.zero_grad(set_to_none=True)
+                bbsplat_gaussians.optimizer.step()
+                bbsplat_gaussians.optimizer.zero_grad(set_to_none = True)
+
+                # L = build_scaling_rotation(gaussians.get_scaling, gaussians.get_rotation)
+                # actual_covariance = L @ L.transpose(1, 2)
+
+                # def op_sigmoid(x, k=100, x0=0.995):
+                #     return 1 / (1 + torch.exp(-k * (x - x0)))
+
+                # #size = len(gaussians.get_texture_alpha)
+                # #opacity = gaussians.get_texture_alpha.view(size, -1).mean(1, keepdim=True) * 10 # Rescale to get maximum = 1
+                # opacity = torch.ones([gaussians.get_texture_alpha.shape[0], 1], dtype=torch.float32, device="cuda") # Fix opacity to 1 (results in the paper obtained this way)
+                # noise = torch.randn_like(gaussians._xyz) * (op_sigmoid(1 - opacity)) * opt.noise_lr * xyz_lr
+                # noise = torch.bmm(actual_covariance, noise.unsqueeze(-1)).squeeze(-1)
+                # gaussians._xyz.add_(noise)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((refine_gaussians.capture(), iteration+load_iteration), scene.model_path + "/chkpnt" + str(iteration+load_iteration) + ".pth")
-                app_model.save_weights(scene.model_path, iteration+load_iteration)
+                torch.save((bbsplat_gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
     
     app_model.save_weights(scene.model_path, opt.iterations+load_iteration)
     torch.cuda.empty_cache()
-
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, gaussians, renderFunc, renderArgs, app_model):
-    if tb_writer:
-        tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
-        tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
-        tb_writer.add_scalar('iter_time', elapsed, iteration)
-
-    # Report test and samples of training set
-    if iteration in testing_iterations:
-        torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
-
-        for config in validation_configs:
-            if config['cameras'] and len(config['cameras']) > 0:
-                l1_test = 0.0
-                psnr_test = 0.0
-                for idx, viewpoint in enumerate(config['cameras']):
-                    out = renderFunc(viewpoint, gaussians, *renderArgs, app_model=app_model)
-                    image = out["render"]
-                    if 'app_image' in out:
-                        image = out['app_image']
-                    image = torch.clamp(image, 0.0, 1.0)
-                    gt_image, _ = viewpoint.get_image()
-                    gt_image = torch.clamp(gt_image.to("cuda"), 0.0, 1.0)
-                    if tb_writer and (idx < 5):
-                        tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
-                        if iteration == testing_iterations[0]:
-                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
-                    l1_test += l1_loss(image, gt_image).mean().double()
-                    psnr_test += psnr(image, gt_image).mean().double()
-                psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
-                if tb_writer:
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
-
-        if tb_writer:
-            tb_writer.add_histogram("scene/opacity_histogram", gaussians.get_opacity, iteration)
-            tb_writer.add_scalar('total_points', gaussians.get_xyz.shape[0], iteration)
-        torch.cuda.empty_cache()
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -215,7 +216,6 @@ def prepare_output_and_logger(args):
         else:
             unique_str = str(uuid.uuid4())
         args.model_path = os.path.join("./output/", unique_str[0:10])
-
         
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
@@ -230,6 +230,66 @@ def prepare_output_and_logger(args):
     else:
         print("Tensorboard not available: not logging progress")
     return tb_writer
+
+@torch.no_grad()
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
+    if tb_writer:
+        tb_writer.add_scalar('train_loss_patches/reg_loss', Ll1.item(), iteration)
+        tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
+        tb_writer.add_scalar('iter_time', elapsed, iteration)
+        tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
+
+    # Report test and samples of training set
+    if iteration in testing_iterations:
+        torch.cuda.empty_cache()
+        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
+                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
+
+        for config in validation_configs:
+            if config['cameras'] and len(config['cameras']) > 0:
+                l1_test = 0.0
+                psnr_test = 0.0
+                for idx, viewpoint in enumerate(config['cameras']):
+                    render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs)
+                    image = torch.clamp(render_pkg["render"], 0.0, 1.0)
+                    gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                    if tb_writer and (idx < 5):
+                        from utils.general_utils import colormap
+                        depth = render_pkg["surf_depth"]
+                        norm = depth.max()
+                        depth = depth / norm
+                        depth = colormap(depth.cpu().numpy()[0], cmap='turbo')
+                        tb_writer.add_images(config['name'] + "_view_{}/depth".format(viewpoint.image_name), depth[None], global_step=iteration)
+                        tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
+
+                        try:
+                            rend_alpha = render_pkg['rend_alpha']
+                            rend_normal = render_pkg["rend_normal"] * 0.5 + 0.5
+                            surf_normal = render_pkg["surf_normal"] * 0.5 + 0.5
+                            tb_writer.add_images(config['name'] + "_view_{}/rend_normal".format(viewpoint.image_name), rend_normal[None], global_step=iteration)
+                            tb_writer.add_images(config['name'] + "_view_{}/surf_normal".format(viewpoint.image_name), surf_normal[None], global_step=iteration)
+                            tb_writer.add_images(config['name'] + "_view_{}/rend_alpha".format(viewpoint.image_name), rend_alpha[None], global_step=iteration)
+
+                            rend_dist = render_pkg["rend_dist"]
+                            rend_dist = colormap(rend_dist.cpu().numpy()[0])
+                            tb_writer.add_images(config['name'] + "_view_{}/rend_dist".format(viewpoint.image_name), rend_dist[None], global_step=iteration)
+                        except:
+                            pass
+
+                        if iteration == testing_iterations[0]:
+                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
+
+                    l1_test += l1_loss(image, gt_image).mean().double()
+                    psnr_test += psnr(image, gt_image).mean().double()
+
+                psnr_test /= len(config['cameras'])
+                l1_test /= len(config['cameras'])
+                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                if tb_writer:
+                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
+                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+
+        torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     torch.set_num_threads(8)
