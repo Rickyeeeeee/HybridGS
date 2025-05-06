@@ -6,10 +6,11 @@ import numpy as np
 from random import randint
 from utils.loss_utils import l1_loss, ssim, lncc, get_img_grad_weight
 from utils.graphics_utils import patch_offsets, patch_warp
-from gaussian_renderer import render, network_gui
+from gaussian_renderer import render_3dgs, network_gui
 import sys, time
 from scene import Scene, GaussianModel
 from scene.refine_model import RefineGaussianModel
+from scene.bbsplat_model import BBSplatGaussianModel
 from scene.dataset_readers import fetchPly
 from utils.general_utils import safe_state
 import cv2
@@ -45,7 +46,7 @@ def refinement(dataset, opt, pipe, testing_iterations, saving_iterations, checkp
 
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians, load_iteration=None)
-    refine_gaussians = RefineGaussianModel()
+    refine_gaussians = BBSplatGaussianModel(sh_degree=3)
     source_model_ply_path = os.path.join(dataset.source_model_path, dataset.source_ply_name)
     pcd = fetchPly(source_model_ply_path)
     refine_gaussians.create_from_pcd(pcd, scene.cameras_extent)
@@ -86,7 +87,7 @@ def refinement(dataset, opt, pipe, testing_iterations, saving_iterations, checkp
         gt_image, _ = viewpoint_cam.get_image()
         
         bg = torch.rand((3), device="cuda") if opt.random_background else background
-        render_pkg = render(viewpoint_cam, refine_gaussians, pipe, bg, app_model=app_model,
+        render_pkg = render_3dgs(viewpoint_cam, refine_gaussians, pipe, bg, app_model=app_model,
                             return_plane=False, return_depth_normal=False)
         image, viewspace_point_tensor, visibility_filter, radii = \
             render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
@@ -124,7 +125,7 @@ def refinement(dataset, opt, pipe, testing_iterations, saving_iterations, checkp
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, refine_gaussians, render, (pipe, background), app_model)
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, refine_gaussians, render_3dgs, (pipe, background), app_model)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 point_cloud_path = os.path.join(scene.model_path, "point_cloud/iteration_{}".format(iteration + load_iteration))

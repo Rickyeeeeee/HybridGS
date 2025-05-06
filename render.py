@@ -15,7 +15,7 @@ import os
 import json
 from tqdm import tqdm
 from os import makedirs
-from gaussian_renderer import render
+from gaussian_renderer import render_3dgs
 import torchvision
 from utils.general_utils import safe_state
 from argparse import ArgumentParser
@@ -77,7 +77,7 @@ def render_set(model_path, name, iteration, views, scene, gaussians, pipeline, b
     depths_tsdf_fusion = []
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         gt, _ = view.get_image()
-        out = render(view, gaussians, pipeline, background, app_model=app_model)
+        out = render_3dgs(view, gaussians, pipeline, background, app_model=app_model)
         rendering = out["render"].clamp(0.0, 1.0)
         _, H, W = rendering.shape
 

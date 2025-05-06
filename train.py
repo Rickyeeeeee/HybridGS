@@ -17,7 +17,7 @@ import numpy as np
 from random import randint
 from utils.loss_utils import l1_loss, ssim, lncc, get_img_grad_weight
 from utils.graphics_utils import patch_offsets, patch_warp
-from gaussian_renderer import render, network_gui
+from gaussian_renderer import render_3dgs, network_gui
 import sys, time
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -159,7 +159,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             pipe.debug = True
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, app_model=app_model,
+        render_pkg = render_3dgs(viewpoint_cam, gaussians, pipe, bg, app_model=app_model,
                             return_plane=iteration>opt.single_view_weight_from_iter, return_depth_normal=iteration>opt.single_view_weight_from_iter)
         image, viewspace_point_tensor, visibility_filter, radii = \
             render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
@@ -215,7 +215,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     torch.arange(W), torch.arange(H), indexing='xy')
                 pixels = torch.stack([ix, iy], dim=-1).float().to(render_pkg['plane_depth'].device)
 
-                nearest_render_pkg = render(nearest_cam, gaussians, pipe, bg, app_model=app_model,
+                nearest_render_pkg = render_3dgs(nearest_cam, gaussians, pipe, bg, app_model=app_model,
                                             return_plane=True, return_depth_normal=False)
 
                 pts = gaussians.get_points_from_depth(viewpoint_cam, render_pkg['plane_depth'])
@@ -352,7 +352,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), app_model)
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render_3dgs, (pipe, background), app_model)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -375,7 +375,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 observe_the = 2
                 observe_cnt = torch.zeros_like(gaussians.get_opacity)
                 for view in scene.getTrainCameras():
-                    render_pkg_tmp = render(view, gaussians, pipe, bg, app_model=app_model, return_plane=False, return_depth_normal=False)
+                    render_pkg_tmp = render_3dgs(view, gaussians, pipe, bg, app_model=app_model, return_plane=False, return_depth_normal=False)
                     out_observe = render_pkg_tmp["out_observe"]
                     observe_cnt[out_observe > 0] += 1
                 prune_mask = (observe_cnt < observe_the).squeeze()
