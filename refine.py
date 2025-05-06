@@ -17,7 +17,7 @@ import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr, erode
 from argparse import ArgumentParser, Namespace
-from arguments import ModelParams, PipelineParams, RefinementParams
+from arguments import ModelParams, PipelineParams, RefinementParams, OptimizationParams
 from scene.app_model import AppModel
 from scene.cameras import Camera
 try:
@@ -44,11 +44,11 @@ def refinement(dataset, opt, pipe, testing_iterations, saving_iterations, checkp
     os.system(cmd)
 
     gaussians = GaussianModel(dataset.sh_degree)
-    scene = Scene(dataset, gaussians, load_iteration=None, load_pc_count=load_pc_count)
+    scene = Scene(dataset, gaussians, load_iteration=None)
     refine_gaussians = RefineGaussianModel()
     source_model_ply_path = os.path.join(dataset.source_model_path, dataset.source_ply_name)
     pcd = fetchPly(source_model_ply_path)
-    refine_gaussians.create_from_pcd(pcd)
+    refine_gaussians.create_from_pcd(pcd, scene.cameras_extent)
     refine_gaussians.training_setup(opt)
 
     app_model = AppModel()
@@ -236,6 +236,7 @@ if __name__ == "__main__":
     parser = ArgumentParser(description="Training script parameters")
     lp = ModelParams(parser)
     rp = RefinementParams(parser)
+    op = OptimizationParams(parser)
     pp = PipelineParams(parser)
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--port', type=int, default=6007)
@@ -248,7 +249,6 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     args = parser.parse_args(sys.argv[1:])
-    args.save_iterations.append(args.iterations)
     
     print("Optimizing " + args.model_path)
 
@@ -262,7 +262,7 @@ if __name__ == "__main__":
 
     refinement(
         lp.extract(args), 
-        rp.extract(args), 
+        op.extract(args), 
         pp.extract(args), 
         args.test_iterations, 
         args.save_iterations, 

@@ -6,7 +6,7 @@ out_base_path='/workspace/work/Outputs/dtu'
 eval_path='/workspace/data/replica_sclike_colmap_dnsplatter/dtu_dataset/MVS_Data'
 source_name='pgsr'
 out_name='from_pgsr'
-gpu_id=1
+gpu_id=3
 
 for scene in scenes:
     cmd = f'rm -rf {out_base_path}/{out_name}/dtu_scan{scene}/*'
@@ -21,7 +21,7 @@ for scene in scenes:
     cmd = f'CUDA_VISIBLE_DEVICES={gpu_id} python refine.py \
             -s {data_base_path}/scan{scene} \
             -m {out_base_path}/{out_name}/dtu_scan{scene} \
-            --source_model_path {out_base_path}/{source_name}/dtu_scan{scene} \
+            --source_model_path {out_base_path}/{source_name}/dtu_scan{scene}/mesh \
             --source_ply_name sample-100000.ply \
             {common_args}'
     print(cmd)
@@ -44,9 +44,9 @@ for scene in scenes:
 #     print(cmd)
 #     os.system(cmd)
 
-    cmd = f"CUDA_VISIBLE_DEVICES={gpu_id} python metrics.py " + \
-          f"-m {out_base_path}/{out_name}/dtu_scan{scene} "
-    print(cmd)
-    os.system(cmd)
+    # cmd = f"CUDA_VISIBLE_DEVICES={gpu_id} python metrics.py " + \
+    #       f"-m {out_base_path}/{out_name}/dtu_scan{scene} "
+    # print(cmd)
+    # os.system(cmd)
 
     break

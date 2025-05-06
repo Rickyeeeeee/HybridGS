@@ -42,7 +42,7 @@ class RefineGaussianModel:
 
         self.rotation_activation = torch.nn.functional.normalize
 
-    def __init__(self, sh_degree : int):
+    def __init__(self, sh_degree : int=3):
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree  
         self._xyz = torch.empty(0)
