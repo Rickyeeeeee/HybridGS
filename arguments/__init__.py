@@ -52,6 +52,8 @@ class ModelParams(ParamGroup):
         self._images = "images"
         self._resolution = -1
         self._white_background = False
+        self.source_ply_name = ""
+        self.source_model_path = ""
         self.data_device = "cuda"
         self.eval = False
         self.preload_img = True

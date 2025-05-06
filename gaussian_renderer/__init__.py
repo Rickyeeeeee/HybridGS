@@ -13,7 +13,7 @@ import torch
 import math
 from diff_plane_rasterization import GaussianRasterizationSettings as PlaneGaussianRasterizationSettings
 from diff_plane_rasterization import GaussianRasterizer as PlaneGaussianRasterizer
-from scene.gaussian_model import GaussianModel
+from scene.refine_model import RefineGaussianModel
 from scene.app_model import AppModel
 from utils.sh_utils import eval_sh
 from utils.graphics_utils import normal_from_depth_image
@@ -32,7 +32,7 @@ def render_normal(viewpoint_cam, depth, offset=None, normal=None, scale=1):
     normal_ref = normal_ref.permute(2,0,1)
     return normal_ref
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, 
+def render(viewpoint_camera, pc, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, 
            app_model: AppModel=None, return_plane = True, return_depth_normal = True):
     """
     Render the scene. 
